@@ -253,7 +253,7 @@ function make_cnn(input_size, kernel_width, num_kernels)
   return nn.gModule({input}, {output})
 end
 
-function make_highway(input_size, num_layers, output_size, bias, f)
+function make_highway(input_size, num_layers, output_size, use_bn, f)
   -- size = dimensionality of inputs
   -- num_layers = number of hidden layers (default = 1)
   -- bias = bias for transform gate (default = -2)
@@ -262,7 +262,6 @@ function make_highway(input_size, num_layers, output_size, bias, f)
   local num_layers = num_layers or 1
   local input_size = input_size
   local output_size = output_size or input_size
-  local bias = bias or -2
   local f = f or nn.ReLU()
   local start = nn.Identity()()
   local transform_gate, carry_gate, input, output
@@ -272,12 +271,17 @@ function make_highway(input_size, num_layers, output_size, bias, f)
     else
       input = start
     end
-    output = f(nn.Linear(input_size, output_size)(input))
-    transform_gate = nn.Sigmoid()(nn.AddConstant(bias, true)(
-        nn.Linear(input_size, output_size)(input)))
+    if use_bn then
+        output = f(nn.BatchNormalization(output_size)(nn.Linear(input_size, output_size)(input)))
+    else
+        output = f(nn.Linear(input_size, output_size)(input))
+    end
+    local gate_lin = nn.Linear(input_size, output_size)
+    gate_lin.name = "gate_lin" -- so we can init bias if we want....
+    transform_gate = nn.Sigmoid()(gate_lin(input))
     carry_gate = nn.AddConstant(1, true)(nn.MulConstant(-1)(transform_gate))
     local proj
-    if input_size==output_size then
+    if input_size == output_size then
       proj = nn.Identity()
     else
       proj = nn.Linear(input_size, output_size, false)
@@ -289,3 +293,26 @@ function make_highway(input_size, num_layers, output_size, bias, f)
   return nn.gModule({start},{input})
 end
 
+function make_predictor(data, opt, block_sizes, max_src_len)
+    local mlp = nn.Sequential()
+        :add(nn.LookupTable(data.source_size, opt.word_vec_size))
+        :add(nn.Transpose({1, 2}))
+        :add(nn.Reshape(-1, max_src_len*opt.word_vec_size))
+        :add(nn.Squeeze(2))
+    local inp_size = max_src_len*opt.word_vec_size
+    for i = 1, #block_sizes do
+        local nlayers, outdim = block_sizes[i][1], block_sizes[i][2]
+        mlp:add(make_highway(inp_size, nlayers, outdim, opt.use_bn))
+        inp_size = outdim
+        if opt.dropout > 0 then
+            mlp:add(nn.Dropout(opt.dropout))
+        end
+    end
+    mlp:add(nn.Linear(inp_size, target_vocab*max_targ_len))
+    -- now get matrix of preds-b1-t1 preds-b2-t1 ... preds-bN-tM so we can use targets as usual
+    mlp:add(nn.View(-1, max_targ_len, target_vocab))  -- batchSize x targetLength x V
+    mlp:add(nn.Transpose({1, 2}))
+    mlp:add(nn.View(-1, target_vocab)) -- targetLength*batchSize x V
+    mlp:add(nn.LogSoftMax()) -- can now feed this and target:view(-1) to crit
+    return mlp
+end
