@@ -2,7 +2,7 @@ require 'nn'
 require 'nngraph'
 require 'hdf5'
 
-require 's2sa.data'
+require 's2sa.data2'
 require 's2sa.models'
 require 's2sa.model_utils'
 
@@ -149,9 +149,9 @@ function train(train_data, valid_data)
       end
     end
     local p, gp = layers[i]:getParameters()
-    if opt.train_from:len() == 0 then
-      p:uniform(-opt.param_init, opt.param_init)
-    end
+    -- if opt.train_from:len() == 0 then
+    --   p:uniform(-opt.param_init, opt.param_init)
+    -- end
     num_params = num_params + p:size(1)
     params[i] = p
     grad_params[i] = gp
@@ -165,13 +165,6 @@ function train(train_data, valid_data)
       word_vec_layers[1].weight[i]:copy(pre_word_vecs[i])
     end
   end
-  if opt.pre_word_vecs_dec:len() > 0 then
-    local f = hdf5.open(opt.pre_word_vecs_dec)
-    local pre_word_vecs = f:read('word_vecs'):all()
-    for i = 1, pre_word_vecs:size(1) do
-      word_vec_layers[2].weight[i]:copy(pre_word_vecs[i])
-    end
-  end
 
 
   print("Number of parameters: " .. num_params .. " (active: " .. num_params-num_prunedparams .. ")")
@@ -179,20 +172,17 @@ function train(train_data, valid_data)
   if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
     cutorch.setDevice(opt.gpuid)
     word_vec_layers[1].weight[1]:zero()
-    cutorch.setDevice(opt.gpuid2)
-    word_vec_layers[2].weight[1]:zero()
   else
     word_vec_layers[1].weight[1]:zero()
-    word_vec_layers[2].weight[1]:zero()
-    if opt.brnn == 1 then
-      word_vec_layers[3].weight[1]:zero()
-    end
   end
 
 
   -- decay learning rate if val perf does not improve or we hit the opt.start_decay_at limit
   function decay_lr(epoch)
     print(opt.val_perf)
+    if opt.decay_schedule2 then
+        start_decay = 0
+    end
     if epoch >= opt.start_decay_at then
       start_decay = 1
     end
@@ -234,8 +224,8 @@ function train(train_data, valid_data)
       encoder:training()
       local preds = encoder:forward(source)
 
-      local loss = criterion:forward(preds, target_out)/batch_l
-      local dl_dpred = criterion:backward(preds, target_out)
+      local loss = criterion:forward(preds, target_out:view(-1))/batch_l
+      local dl_dpred = criterion:backward(preds, target_out:view(-1))
       dl_dpred:div(batch_l)
       encoder:backward(source, dl_dpred)
 
@@ -352,140 +342,25 @@ function train(train_data, valid_data)
 end
 
 function eval(data)
-  encoder_clones[1]:evaluate()
-  decoder_clones[1]:evaluate() -- just need one clone
-  generator:evaluate()
-  if opt.brnn == 1 then
-    encoder_bwd_clones[1]:evaluate()
-  end
-
+  encoder:evaluate()
   local nll = 0
-  local nll_cll = 0
   local total = 0
   for i = 1, data:size() do
     local d = data[i]
     local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
     local batch_l, target_l, source_l = d[5], d[6], d[7]
-    local source_features = d[9]
-    local alignment = d[10]
-    local norm_alignment
-    if opt.guided_alignment == 1 then
-      replicator=nn.Replicate(alignment:size(2),2)
-      if opt.gpuid >= 0 then
-        cutorch.setDevice(opt.gpuid)
-        if opt.gpuid2 >= 0 then -- alignment is in the 2nd GPU
-          cutorch.setDevice(opt.gpuid2)
-        end
-        replicator = replicator:cuda()
-      end
-      norm_alignment = torch.cdiv(alignment, replicator:forward(torch.sum(alignment,2):squeeze(2)))
-      norm_alignment[norm_alignment:ne(norm_alignment)] = 0
-    end
-
     if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
       cutorch.setDevice(opt.gpuid)
     end
-    local rnn_state_enc = reset_state(init_fwd_enc, batch_l)
-    local context = context_proto[{{1, batch_l}, {1, source_l}}]
-    -- forward prop encoder
-    for t = 1, source_l do
-      local encoder_input = {source[t]}
-      if data.num_source_features > 0 then
-        append_table(encoder_input, source_features[t])
-      end
-      append_table(encoder_input, rnn_state_enc)
-      local out = encoder_clones[1]:forward(encoder_input)
-      rnn_state_enc = out
-      context[{{},t}]:copy(out[#out])
-    end
 
-    if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
-      cutorch.setDevice(opt.gpuid2)
-      local context2 = context_proto2[{{1, batch_l}, {1, source_l}}]
-      context2:copy(context)
-      context = context2
-    end
+    local preds = encoder:forward(source)
 
-    local rnn_state_dec = reset_state(init_fwd_dec, batch_l)
-    if opt.init_dec == 1 then
-      for L = 1, opt.num_layers do
-        rnn_state_dec[L*2-1+opt.input_feed]:copy(rnn_state_enc[L*2-1])
-        rnn_state_dec[L*2+opt.input_feed]:copy(rnn_state_enc[L*2])
-      end
-    end
-
-    if opt.brnn == 1 then
-      local rnn_state_enc = reset_state(init_fwd_enc, batch_l)
-      for t = source_l, 1, -1 do
-        local encoder_input = {source[t]}
-        if data.num_source_features > 0 then
-          append_table(encoder_input, source_features[t])
-        end
-        append_table(encoder_input, rnn_state_enc)
-        local out = encoder_bwd_clones[1]:forward(encoder_input)
-        rnn_state_enc = out
-        context[{{},t}]:add(out[#out])
-      end
-      if opt.init_dec == 1 then
-        for L = 1, opt.num_layers do
-          rnn_state_dec[L*2-1+opt.input_feed]:add(rnn_state_enc[L*2-1])
-          rnn_state_dec[L*2+opt.input_feed]:add(rnn_state_enc[L*2])
-        end
-      end
-    end
-
-    local loss = 0
-    local loss_cll = 0
-    local attn_outputs = {}
-    for t = 1, target_l do
-      local decoder_input
-      if opt.attn == 1 then
-        decoder_input = {target[t], context, table.unpack(rnn_state_dec)}
-      else
-        decoder_input = {target[t], context[{{},source_l}], table.unpack(rnn_state_dec)}
-      end
-      local out = decoder_clones[1]:forward(decoder_input)
-
-      local out_pred_idx = #out
-      if opt.guided_alignment == 1 then
-        out_pred_idx = #out-1
-        table.insert(attn_outputs, out[#out])
-      end
-
-      rnn_state_dec = {}
-      if opt.input_feed == 1 then
-        table.insert(rnn_state_dec, out[out_pred_idx])
-      end
-      for j = 1, out_pred_idx-1 do
-        table.insert(rnn_state_dec, out[j])
-      end
-      local pred = generator:forward(out[out_pred_idx])
-
-      local input = pred
-      local output = target_out[t]
-      if opt.guided_alignment == 1 then
-        input={input, attn_outputs[t]}
-        output={output, norm_alignment[{{},{},t}]}
-      end
-
-      loss = loss + criterion:forward(input, output)
-
-      if opt.guided_alignment == 1 then
-        loss_cll = loss_cll + cll_criterion:forward(input[1], output[1])
-      end
-    end
+    local loss = criterion:forward(preds, target_out:view(-1))
     nll = nll + loss
-    if opt.guided_alignment == 1 then
-      nll_cll = nll_cll + loss_cll
-    end
     total = total + nonzeros
   end
   local valid = math.exp(nll / total)
   print("Valid", valid)
-  if opt.guided_alignment == 1 then
-    local valid_cll = math.exp(nll_cll / total)
-    print("Valid_cll", valid_cll)
-  end
   collectgarbage()
   return valid
 end
@@ -537,6 +412,10 @@ function main()
 
   valid_data = data.new(opt, opt.val_data_file)
   print('done!')
+
+  local max_source_l = train_data.source_l:max()
+  local max_targ_l = train_data.target_l:max()
+
   print(string.format('Source vocab size: %d, Target vocab size: %d',
       valid_data.source_size, valid_data.target_size))
   opt.max_sent_l_src = valid_data.source:size(2)
@@ -554,18 +433,27 @@ function main()
 
   print(string.format('Number of additional features on source side: %d', valid_data.num_source_features))
 
-  -- Enable memory preallocation - see memory.lua
-  preallocateMemory(opt.prealloc)
+  -- -- Enable memory preallocation - see memory.lua
+  -- preallocateMemory(opt.prealloc)
 
   -- Build model
+  -- block sizes are in format {nlayers, outputsize}
+  local block_sizes = {
+      {2, max_source_l*opt.word_vec_size/2},
+      {2, max_source_l*opt.word_vec_size/4},
+      {2, max_source_l*opt.word_vec_size/8},
+      {2, max_source_l*opt.word_vec_size/16},
+      {2, max_source_l*opt.word_vec_size/32}
+  }
   if opt.train_from:len() == 0 then
-    encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
-    decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
-    generator, criterion = make_generator(valid_data, opt)
-    if opt.brnn == 1 then
-      encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
-    end
+    encoder = make_predictor(valid_data, opt, block_sizes, max_source_l, max_targ_l)
+    --generator, criterion = make_generator(valid_data, opt)
+    local w = torch.ones(valid_data.target_size)
+    w[1] = 0
+    criterion = nn.ClassNLLCriterion(w)
+    criterion.sizeAverage = false
   else
+    assert(false)
     assert(path.exists(opt.train_from), 'checkpoint path invalid')
     print('loading ' .. opt.train_from .. '...')
     local checkpoint = torch.load(opt.train_from)
@@ -584,18 +472,8 @@ function main()
     _, criterion = make_generator(valid_data, opt)
   end
 
-  if opt.guided_alignment == 1 then
-    cll_criterion = criterion
-    criterion = nn.ParallelCriterion()
-    criterion:add(cll_criterion, (1-opt.guided_alignment_weight))
-    -- sum of alignment weight reconstruction loss over all input/output pair; averaged
-    criterion:add(nn.MSECriterion(), opt.guided_alignment_weight)
-  end
 
-  layers = {encoder, decoder, generator}
-  if opt.brnn == 1 then
-    table.insert(layers, encoder_bwd)
-  end
+  layers = {encoder}
 
   if opt.optim ~= 'sgd' then
     layer_etas = {}
@@ -640,18 +518,7 @@ function main()
 
   -- these layers will be manipulated during training
   word_vec_layers = {}
-  if opt.use_chars_enc == 1 then
-    charcnn_layers = {}
-    charcnn_grad_layers = {}
-  end
   encoder:apply(get_layer)
-  decoder:apply(get_layer)
-  if opt.brnn == 1 then
-    if opt.use_chars_enc == 1 then
-      charcnn_offset = #charcnn_layers
-    end
-    encoder_bwd:apply(get_layer)
-  end
   train(train_data, valid_data)
 end
 

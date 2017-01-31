@@ -293,12 +293,13 @@ function make_highway(input_size, num_layers, output_size, use_bn, f)
   return nn.gModule({start},{input})
 end
 
-function make_predictor(data, opt, block_sizes, max_src_len)
+function make_predictor(data, opt, block_sizes, max_src_len, max_targ_len, share_decoder)
     local mlp = nn.Sequential()
         :add(nn.LookupTable(data.source_size, opt.word_vec_size))
         :add(nn.Transpose({1, 2}))
         :add(nn.Reshape(-1, max_src_len*opt.word_vec_size))
         :add(nn.Squeeze(2))
+    mlp:get(1).name = 'word_vecs_enc'
     local inp_size = max_src_len*opt.word_vec_size
     for i = 1, #block_sizes do
         local nlayers, outdim = block_sizes[i][1], block_sizes[i][2]
@@ -308,11 +309,20 @@ function make_predictor(data, opt, block_sizes, max_src_len)
             mlp:add(nn.Dropout(opt.dropout))
         end
     end
-    mlp:add(nn.Linear(inp_size, target_vocab*max_targ_len))
-    -- now get matrix of preds-b1-t1 preds-b2-t1 ... preds-bN-tM so we can use targets as usual
-    mlp:add(nn.View(-1, max_targ_len, target_vocab))  -- batchSize x targetLength x V
-    mlp:add(nn.Transpose({1, 2}))
-    mlp:add(nn.View(-1, target_vocab)) -- targetLength*batchSize x V
-    mlp:add(nn.LogSoftMax()) -- can now feed this and target:view(-1) to crit
+    if share_decoder then
+        assert(inp_size % max_targ_len == 0)
+        mlp:add(nn.View(-1, max_targ_len, inp_size/max_targ_len)) -- batchsize x max_targ_len x final layer size
+        mlp:add(nn.Transpose({1, 2})) --
+        mlp:add(nn.Reshape(-1, inp_size/max_targ_len, false))
+        mlp:add(nn.Linear(inp_size/max_targ_len, data.target_size))
+        mlp:add(nn.LogSoftMax())
+    else
+        mlp:add(nn.Linear(inp_size, data.target_size*max_targ_len))
+        -- now get matrix of preds-b1-t1 preds-b2-t1 ... preds-bN-tM so we can use targets as usual
+        mlp:add(nn.View(-1, max_targ_len, data.target_size))  -- batchSize x targetLength x V
+        mlp:add(nn.Transpose({1, 2}))
+        mlp:add(nn.Reshape(-1, data.target_size, false)) -- targetLength*batchSize x V
+        mlp:add(nn.LogSoftMax()) -- can now feed this and target:view(-1) to crit
+    end
     return mlp
 end
